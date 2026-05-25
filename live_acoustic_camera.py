@@ -5,6 +5,9 @@ import cv2
 import sounddevice as sd
 from scipy import signal
 
+# Disable Acoular's HDF5 caching for live processing
+ac.config.global_caching = 'none'
+
 # -----------------------------------------------------------------------------
 # HARDWARE CONFIGURATION
 # -----------------------------------------------------------------------------
@@ -138,38 +141,25 @@ def main():
                 print("Audio buffer overflow - skipping frame")
                 continue
 
-            # Transpose audio data to shape (channels, samples)
-            audio_block = audio_data.T
+            # Create TimeSamples object from audio block
+            # audio_data shape: (samples, channels) - already correct for TimeSamples
+            ts = ac.TimeSamples(data=audio_data, sample_freq=SAMPLE_RATE)
             
-            # Compute FFT for each channel
-            freqs = np.fft.rfftfreq(BLOCK_SIZE, 1/SAMPLE_RATE)
-            fft_data = np.fft.rfft(audio_block, axis=1)
+            # Compute PowerSpectra using Acoular's pipeline
+            ps = ac.PowerSpectra(
+                source=ts,
+                block_size=BLOCK_SIZE,
+                window='Hanning',
+                overlap='None',
+                cached=False
+            )
             
-            # Find target frequency index
-            freq_idx = np.argmin(np.abs(freqs - TARGET_FREQ))
-            
-            # Compute Cross-Spectral Matrix at target frequency
-            fft_slice = fft_data[:, freq_idx:freq_idx+1]  # Keep 2D
-            csm_matrix = np.dot(fft_slice, fft_slice.conj().T) / BLOCK_SIZE
-            
-            # Create PowerSpectra object for beamformer
-            # PowerSpectra expects shape (num_freqs, num_channels, num_channels)
-            csm_3d = csm_matrix[np.newaxis, :, :]  # Add frequency dimension
-            
-            # Create a mock PowerSpectra object
-            class MockPowerSpectra:
-                def __init__(self, csm, freq):
-                    self.csm = csm
-                    self.freq = np.array([freq])
-                    self.num_channels = csm.shape[1]
-                    
-            ps = MockPowerSpectra(csm_3d, TARGET_FREQ)
             beamformer.freq_data = ps
             
             # Compute beamformer output at target frequency
             try:
                 acoustic_result = beamformer.synthetic(TARGET_FREQ, 1)
-                acoustic_map = acoustic_result[0]  # Get first frequency result
+                acoustic_map = np.abs(acoustic_result)
             except Exception as e:
                 print(f"Beamformer error: {e}")
                 continue
