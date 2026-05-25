@@ -10,9 +10,10 @@ from scipy import signal
 # -----------------------------------------------------------------------------
 # To find your device, run: python -c "import sounddevice as sd; print(sd.query_devices())"
 # Look for the UMA-16 device with 16 input channels
-UMA16_DEVICE_INDEX = 35  # Line (UMA16v2), Windows WDM-KS - adjust if needed
+# IMPORTANT: Use WASAPI (device 20), NOT WDM-KS (device 35) - WDM-KS doesn't support blocking API!
+UMA16_DEVICE_INDEX = 20  # Line (MCHStreamer Multi-channels), Windows WASAPI
 NUM_CHANNELS = 16
-SAMPLE_RATE = 44100
+SAMPLE_RATE = 48000
 BLOCK_SIZE = 4096
 
 # Load UMA-16 microphone geometry from Acoular's built-in XML file
@@ -105,13 +106,14 @@ def main():
     if not find_uma16_device():
         return
     
-    # Find camera
-    if CAMERA_INDEX is None:
+    # Determine which camera to use
+    if CAMERA_INDEX is not None:
+        camera_idx = CAMERA_INDEX
+        print(f"\nUsing specified camera {camera_idx}")
+    else:
         camera_idx = find_uma16_camera()
         if camera_idx is None:
             return
-    else:
-        camera_idx = CAMERA_INDEX
     
     cap = cv2.VideoCapture(camera_idx)
     if not cap.isOpened():
