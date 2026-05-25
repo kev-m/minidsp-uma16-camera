@@ -3,7 +3,6 @@ import acoular as ac
 import numpy as np
 import cv2
 import sounddevice as sd
-from scipy import signal
 
 # Disable Acoular's HDF5 caching for live processing
 ac.config.global_caching = 'none'
@@ -17,27 +16,30 @@ ac.config.global_caching = 'none'
 UMA16_DEVICE_INDEX = 20  # Line (MCHStreamer Multi-channels), Windows WASAPI
 NUM_CHANNELS = 16
 SAMPLE_RATE = 48000
-BLOCK_SIZE = 4096
 
 # Load UMA-16 microphone geometry from Acoular's built-in XML file
 # Uses the official miniDSP UMA-16 microphone positions
 mic_geom = ac.MicGeom(file='.venv/Lib/site-packages/acoular/xml/minidsp_uma-16_mirrored.xml')
 
-# Try the last camera
+# Camera to use
 CAMERA_INDEX = 2
 
 # -----------------------------------------------------------------------------
 # ACOUSTIC GRID & STEERING VECTOR
 # -----------------------------------------------------------------------------
 GRID_DISTANCE = 1.0  
-grid = ac.RectGrid(x_min=-0.5, x_max=0.5, y_min=-0.5, y_max=0.5, z=GRID_DISTANCE, increment=0.03)
-steering_vector = ac.SteeringVector(grid=grid, mics=mic_geom)
+GRID_INCREMENT = 0.03
+grid = ac.RectGrid(x_min=-0.5, x_max=0.5, y_min=-0.5, y_max=0.5, z=GRID_DISTANCE, increment=GRID_INCREMENT)
 
-# Beamformer setup
-beamformer = ac.BeamformerBase(freq_data=None, steer=steering_vector)
+# Calculate grid dimensions for reshaping
+GRID_X_DIM = int((0.5 - (-0.5)) / GRID_INCREMENT + 1)
+GRID_Y_DIM = int((0.5 - (-0.5)) / GRID_INCREMENT + 1)
 
-TARGET_FREQ = 2000.0 # 2.4kHz is the max supported by this geometry
-FREQ_RANGE = (TARGET_FREQ - 500, TARGET_FREQ + 500)  # Frequency band to analyze
+# Steering Vector
+steer = ac.SteeringVector(env=ac.Environment(c=343), grid=grid, mics=mic_geom)
+
+TARGET_FREQ = 2000.0  # Target frequency in Hz (2.4kHz is max for this geometry)
+AVERAGING_SAMPLES = 512  # Number of samples to average for stability
 
 # -----------------------------------------------------------------------------
 # HELPER FUNCTIONS
@@ -123,74 +125,113 @@ def main():
         print(f"Error: Could not open camera {camera_idx}.")
         return
 
+    print("\nSetting up Acoular processing pipeline...")
+    
+    # Build the Acoular pipeline (same as process.py)
+    # Step 1: Audio source from hardware
+    audio_source = ac.SoundDeviceSamplesGenerator(
+        device=UMA16_DEVICE_INDEX, 
+        num_channels=NUM_CHANNELS
+    )
+    
+    # Step 2: Convert from volts to pascals (miniDSP UMA-16 sensitivity: 0.0016 V/Pa)
+    source_mixer = ac.SourceMixer(
+        sources=[audio_source], 
+        weights=np.array([1/0.0016])
+    )
+    
+    # Step 3: Time-domain beamformer
+    beamformer = ac.BeamformerTime(
+        source=source_mixer, 
+        steer=steer
+    )
+    
+    # Step 4: Filter to target frequency band (fractional octave)
+    frequency_filter = ac.FiltOctave(
+        source=beamformer, 
+        band=TARGET_FREQ, 
+        fraction='Third octave'
+    )
+    
+    # Step 5: Calculate instantaneous power
+    power = ac.TimePower(source=frequency_filter)
+    
+    # Step 6: Time average for stability
+    time_average = ac.Average(
+        source=power, 
+        num_per_average=AVERAGING_SAMPLES
+    )
+    
     print("\nStarting live acoustic camera...")
-    print(f"Microphone array: {NUM_CHANNELS} channels at {SAMPLE_RATE} Hz")
-    print(f"Target frequency: {TARGET_FREQ} Hz")
+    print(f"Microphone array: {NUM_CHANNELS} channels at {audio_source.sample_freq} Hz")
+    print(f"Target frequency: {TARGET_FREQ} Hz (Third octave band)")
+    print(f"Grid: {GRID_X_DIM}x{GRID_Y_DIM} points at {GRID_DISTANCE}m distance")
     print("Press 'q' to quit\n")
     
-    with sd.InputStream(device=UMA16_DEVICE_INDEX, channels=NUM_CHANNELS, 
-                        samplerate=SAMPLE_RATE, blocksize=BLOCK_SIZE) as audio_stream:
-        
+    # Create generator for beamforming results
+    beamforming_gen = time_average.result(num=1)
+    
+    frame_count = 0
+    try:
         while True:
+            # Get camera frame
             ret, frame = cap.read()
             if not ret:
+                print("Camera read failed")
                 break
-                
-            audio_data, overflowed = audio_stream.read(BLOCK_SIZE)
-            if overflowed:
-                print("Audio buffer overflow - skipping frame")
-                continue
-
-            # Create TimeSamples object from audio block
-            # audio_data shape: (samples, channels) - already correct for TimeSamples
-            ts = ac.TimeSamples(data=audio_data, sample_freq=SAMPLE_RATE)
             
-            # Compute PowerSpectra using Acoular's pipeline
-            ps = ac.PowerSpectra(
-                source=ts,
-                block_size=BLOCK_SIZE,
-                window='Hanning',
-                overlap='None',
-                cached=False
-            )
-            
-            beamformer.freq_data = ps
-            
-            # Compute beamformer output at target frequency
+            # Get next beamforming result from Acoular pipeline
             try:
-                acoustic_result = beamformer.synthetic(TARGET_FREQ, 1)
-                acoustic_map = np.abs(acoustic_result)
+                acoustic_result = next(beamforming_gen)
+            except StopIteration:
+                print("Audio stream ended")
+                break
             except Exception as e:
-                print(f"Beamformer error: {e}")
+                print(f"Beamforming error: {e}")
                 continue
             
-            # Post-process map matrix
-            heatmap = acoustic_map.reshape(grid.shape)
-            heatmap_db = 10 * np.log10(np.maximum(heatmap, 1e-12))
-            heatmap_norm = cv2.normalize(heatmap_db, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            # Convert to dB SPL and reshape to 2D grid
+            acoustic_map_db = ac.L_p(acoustic_result)
+            heatmap = acoustic_map_db.reshape((GRID_X_DIM, GRID_Y_DIM))
             
-            # Render visual overlays
+            # Flip y-axis for correct display orientation
+            heatmap = heatmap[:, ::-1]
+            
+            # Normalize for visualization (0-255)
+            heatmap_norm = cv2.normalize(heatmap, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            
+            # Resize to match camera frame and apply colormap
             heatmap_resized = cv2.resize(heatmap_norm, (frame.shape[1], frame.shape[0]))
             heatmap_color = cv2.applyColorMap(heatmap_resized, cv2.COLORMAP_JET)
             
+            # Blend with camera frame
             alpha = 0.5
             blended_frame = cv2.addWeighted(frame, 1 - alpha, heatmap_color, alpha, 0)
             
-            # Add info text
+            # Add overlay text with info
+            max_db = np.max(acoustic_map_db)
             cv2.putText(blended_frame, f"Acoustic Camera: {int(TARGET_FREQ)} Hz", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
-            max_db = np.max(heatmap_db)
-            cv2.putText(blended_frame, f"Max: {max_db:.1f} dB", (20, 80),
+            cv2.putText(blended_frame, f"Max: {max_db:.1f} dB SPL", (20, 80),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-
+            cv2.putText(blended_frame, f"Frame: {frame_count}", (20, 110),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+            
+            # Display result
             cv2.imshow('Live Acoustic Camera (UMA-16)', blended_frame)
             
+            frame_count += 1
+            
+            # Check for quit key
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
-
-    cap.release()
-    cv2.destroyAllWindows()
-    print("Acoustic camera stopped")
+                
+    except KeyboardInterrupt:
+        print("\nInterrupted by user")
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        print(f"\nAcoustic camera stopped after {frame_count} frames")
 
 if __name__ == '__main__':
     main()
