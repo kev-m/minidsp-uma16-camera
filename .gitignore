@@ -1,5 +1,9 @@
 .venv
-miniDSP_UAC2_v4.82*
+.vscode
 
+miniDSP_UAC2_v4.82*
 Product Brief-UMA16.pdf
 UMA16 User Manual.pdf
+
+*.log
+*.xml
