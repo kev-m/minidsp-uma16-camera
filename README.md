@@ -1,17 +1,24 @@
 # Acoustic Camera Applications for miniDSP UMA-16
 
-Real-time acoustic visualization applications using the miniDSP UMA-16 microphone array and video camera. 
+Real-time acoustic visualization applications using the miniDSP UMA-16 microphone array and video camera.
+
 These applications overlay acoustic heatmaps on live video to visualize sound source locations.
+
+Tracking mouse clicks:
+![Tracking mouse clicks](snapshots/2026-06-04-132901.594.png)
+
+Guess where is the sparrow?
+![Guess where is the sparrow?](snapshots/2026-06-04-135313.244.png)
 
 ## Hardware Requirements
 
-- **miniDSP UMA-16** - 16-channel microphone array
+- **miniDSP UMA-16** - [16-channel microphone array](https://www.minidsp.com/products/usb-audio-interface/uma-16-microphone-array)
 - **USB Camera** - For video overlay
 - **Python Environment** - With Acoular, OpenCV, NumPy, and SoundDevice
 
 ## Applications
 
-### 1. `live_acoustic_camera.py` - Continuous Streaming (Fast)
+### 1. [`live_acoustic_camera.py`](live_acoustic_camera.py) - Continuous Streaming (Fast)
 
 #### Algorithm: Pre-Filtered Time-Domain Beamforming
 
@@ -43,7 +50,7 @@ Audio Stream (continuous) → Amplification → Octave Filter (2kHz) → Beamfor
 
 ---
 
-### 2. `batched_acoustic_camera.py` - Batch Processing (Proof of concept. Robust & Reliable)
+### 2. [`batched_acoustic_camera.py`](batched_acoustic_camera.py) - Batch Processing (Proof of concept. Robust & Reliable)
 
 #### Algorithm: Frequency-Domain Beamforming
 
@@ -94,15 +101,6 @@ Audio Capture (batch) → Amplification → FFT (PowerSpectra) → Beamforming �
 
 ## Key Technical Details
 
-### Coordinate System Alignment
-Both applications apply coordinate transformations to align the acoustic grid with video:
-```python
-heatmap = np.flipud(np.fliplr(power_db.T))
-```
-- **Acoustic coordinates:** Y-up (3D), X-right
-- **Image coordinates:** Y-down (pixels), X-right
-- **Transformation:** Transpose, flip horizontally, flip vertically
-
 ### Frequency Limitations
 The UMA-16 array geometry at the configured grid spacing supports accurate beamforming up to approximately **2 kHz**. 
 Above this frequency, spatial aliasing and sidelobes reduce accuracy.
@@ -113,6 +111,28 @@ Both use a small, close-range grid optimized for near-field sources:
 - **Focus Distance:** 30cm from array
 - **Resolution:** 1cm grid spacing
 - **Total Points:** 1,681 (41×41)
+
+---
+
+## Dependencies and Installation
+The current dependencies are:
+```
+python >= 3.10.9
+acoular>=26.0
+opencv-python>=4.13
+numpy>=2.2
+sounddevice>=0.5
+scipy>=1.15
+```
+
+I recommend creating a virtual environment, and installing all dependencies there.
+
+For example, in Windows:
+```cmd
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
 
 ---
 
@@ -134,7 +154,19 @@ Both applications will:
 1. Auto-detect the UMA-16 device (16-channel audio interface)
 2. Open camera at index 1
 3. Display real-time acoustic heatmap overlay
-4. Press **'q'** to quit
+4. Press **CTRL-C** to quit
+
+---
+
+## Performance Notes
+
+- **Frame Rate:** The live camera achieves around 20 FPS on my system, while the batched one achieves around 5 FPS.
+- **CPU Usage:** `live_acoustic_camera.py` is more CPU-efficient due to persistent pipeline
+- **Memory:** Both maintain minimal memory footprint with no caching enabled
+- **Latency:** Continuous streaming version has ~5× lower latency
+
+
+## Customisation
 
 ### Configuration
 
@@ -157,44 +189,6 @@ rg = ac.RectGrid(
     increment=0.01            # Grid spacing (meters)
 )
 ```
-
----
-
-## Dependencies
-
-```
-python >= 3.10.9
-acoular>=26.0
-opencv-python>=4.13
-numpy>=2.2
-sounddevice>=0.5
-scipy>=1.15
-```
-
----
-
-## Performance Notes
-
-- **Frame Rate:** The live camera achieves around 20 FPS on my system, while the batched one achieves around 5 FPS.
-- **CPU Usage:** `live_acoustic_camera.py` is more CPU-efficient due to persistent pipeline
-- **Memory:** Both maintain minimal memory footprint with no caching enabled
-- **Latency:** Continuous streaming version has ~5× lower latency
-
----
-
-## When to Use Which
-
-### Use `batched_acoustic_camera.py` when:
-- You need **proven, reliable** spatial tracking
-- Accuracy is more important than latency
-- You're validating the beamforming setup
-- You're using it as a reference implementation
-
-### Use `live_acoustic_camera.py` when:
-- You need **lowest possible latency**
-- Real-time responsiveness is critical
-- You want maximum efficiency (battery, CPU)
-- The pre-filtered time-domain approach works for your use case
 
 ---
 
