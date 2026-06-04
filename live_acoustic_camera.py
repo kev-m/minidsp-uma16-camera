@@ -13,7 +13,7 @@ ac.config.global_caching = 'none'
 # To find your device, run: python -c "import sounddevice as sd; print(sd.query_devices())"
 # Look for the UMA-16 device with 16 input channels
 # IMPORTANT: Use WASAPI (device 20), NOT WDM-KS (device 35) - WDM-KS doesn't support blocking API!
-UMA16_DEVICE_INDEX = 20  # Line (MCHStreamer Multi-channels), Windows WASAPI
+UMA16_DEVICE_INDEX = 21  # Line (MCHStreamer Multi-channels), Windows WASAPI
 NUM_CHANNELS = 16
 SAMPLE_RATE = 48000
 
@@ -22,24 +22,34 @@ SAMPLE_RATE = 48000
 mic_geom = ac.MicGeom(file='.venv/Lib/site-packages/acoular/xml/minidsp_uma-16_mirrored.xml')
 
 # Camera to use
-CAMERA_INDEX = 2
+CAMERA_INDEX = 1
 
 # -----------------------------------------------------------------------------
 # ACOUSTIC GRID & STEERING VECTOR
 # -----------------------------------------------------------------------------
-GRID_DISTANCE = 1.0  
-GRID_INCREMENT = 0.03
-grid = ac.RectGrid(x_min=-0.5, x_max=0.5, y_min=-0.5, y_max=0.5, z=GRID_DISTANCE, increment=GRID_INCREMENT)
+# Production-tested settings from config.json
+GRID_DISTANCE = 2.0  # Focus distance in meters
+GRID_INCREMENT = 0.05  # Grid spacing (coarser = faster processing)
+GRID_X_MIN = -1.5
+GRID_X_MAX = 1.5
+GRID_Y_MIN = -1.5
+GRID_Y_MAX = 1.5
+
+grid = ac.RectGrid(
+    x_min=GRID_X_MIN, x_max=GRID_X_MAX, 
+    y_min=GRID_Y_MIN, y_max=GRID_Y_MAX, 
+    z=GRID_DISTANCE, 
+    increment=GRID_INCREMENT
+)
 
 # Calculate grid dimensions for reshaping
-GRID_X_DIM = int((0.5 - (-0.5)) / GRID_INCREMENT + 1)
-GRID_Y_DIM = int((0.5 - (-0.5)) / GRID_INCREMENT + 1)
+GRID_X_DIM = int((GRID_X_MAX - GRID_X_MIN) / GRID_INCREMENT + 1)
+GRID_Y_DIM = int((GRID_Y_MAX - GRID_Y_MIN) / GRID_INCREMENT + 1)
 
-# Steering Vector
-steer = ac.SteeringVector(env=ac.Environment(c=343), grid=grid, mics=mic_geom)
-
-TARGET_FREQ = 2000.0  # Target frequency in Hz (2.4kHz is max for this geometry)
+# Was 4000
+TARGET_FREQ = 2000.0  # Target frequency in Hz (higher freq = better resolution)
 AVERAGING_SAMPLES = 512  # Number of samples to average for stability
+BLEND_ALPHA = 0.75  # Video transparency (0.75 from production config)
 
 # -----------------------------------------------------------------------------
 # HELPER FUNCTIONS
@@ -141,7 +151,10 @@ def main():
     )
     
     # Step 3: Time-domain beamformer
-    beamformer = ac.BeamformerTime(
+    # Steering Vector
+    steer = ac.SteeringVector(env=ac.Environment(c=343), grid=grid, mics=mic_geom)
+
+    beamformer = ac.BeamformerBase(
         source=source_mixer, 
         steer=steer
     )
@@ -165,7 +178,9 @@ def main():
     print("\nStarting live acoustic camera...")
     print(f"Microphone array: {NUM_CHANNELS} channels at {audio_source.sample_freq} Hz")
     print(f"Target frequency: {TARGET_FREQ} Hz (Third octave band)")
-    print(f"Grid: {GRID_X_DIM}x{GRID_Y_DIM} points at {GRID_DISTANCE}m distance")
+    print(f"Grid: {GRID_X_DIM}x{GRID_Y_DIM} points ({GRID_X_MIN} to {GRID_X_MAX}m)")
+    print(f"Focus distance: {GRID_DISTANCE}m")
+    print(f"Grid increment: {GRID_INCREMENT}m")
     print("Press 'q' to quit\n")
     
     # Create generator for beamforming results
@@ -204,17 +219,16 @@ def main():
             heatmap_resized = cv2.resize(heatmap_norm, (frame.shape[1], frame.shape[0]))
             heatmap_color = cv2.applyColorMap(heatmap_resized, cv2.COLORMAP_JET)
             
-            # Blend with camera frame
-            alpha = 0.5
-            blended_frame = cv2.addWeighted(frame, 1 - alpha, heatmap_color, alpha, 0)
+            # Blend with camera frame (using production alpha value)
+            blended_frame = cv2.addWeighted(frame, 1 - BLEND_ALPHA, heatmap_color, BLEND_ALPHA, 0)
             
             # Add overlay text with info
             max_db = np.max(acoustic_map_db)
-            cv2.putText(blended_frame, f"Acoustic Camera: {int(TARGET_FREQ)} Hz", (20, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(blended_frame, f"Max: {max_db:.1f} dB SPL", (20, 80),
+            cv2.putText(blended_frame, f"Acoustic Camera: {int(TARGET_FREQ)} Hz @ {GRID_DISTANCE}m", (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(blended_frame, f"Max: {max_db:.1f} dB SPL", (20, 75),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(blended_frame, f"Frame: {frame_count}", (20, 110),
+            cv2.putText(blended_frame, f"Grid: {GRID_X_DIM}x{GRID_Y_DIM} ({GRID_INCREMENT}m)", (20, 105),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
             
             # Display result
