@@ -1,11 +1,13 @@
 # Simple Live Acoustic Camera with Pre-Filtering
 import argparse
 import time
+from datetime import datetime
 import acoular as ac
 import numpy as np
 import cv2
 import sounddevice as sd
 from os import path
+import os
 
 # Disable Acoular's HDF5 caching for live processing
 ac.config.global_caching = 'none'
@@ -92,6 +94,12 @@ def build_arg_parser():
         default=default_db,
         help="dB normalization as db_max,db_range where db_max is 'max' or a fixed value. Example: --db max,3 or --db 85,3"
     )
+    parser.add_argument(
+        '--snapshot-threshold',
+        type=float,
+        default=None,
+        help='Optional peak-trigger threshold in dB SPL for saving frames (example: --snapshot-threshold 55)'
+    )
     return parser
 
 # -----------------------------------------------------------------------------
@@ -172,6 +180,11 @@ def main():
     grid_x_dim = rg.shape[0]
     grid_y_dim = rg.shape[1]
 
+    snapshot_threshold = args.snapshot_threshold
+    snapshot_dir = path.join(path.dirname(__file__), 'snapshots')
+    if snapshot_threshold is not None:
+        os.makedirs(snapshot_dir, exist_ok=True)
+
     # Verify audio device and camera
     if not find_uma16_device():
         return
@@ -218,6 +231,9 @@ def main():
         print(f"dB normalization: db_max=max(frame), db_range={db_range}")
     else:
         print(f"dB normalization: db_max={db_fixed_max}, db_range={db_range}")
+    if snapshot_threshold is not None:
+        print(f"Snapshot trigger: threshold={snapshot_threshold} dB SPL, max 1 image/second, peak-capture mode")
+        print(f"Snapshot directory: {snapshot_dir}")
     print(f"Block size: {BLOCK_SIZE} samples")
     print("Press 'q' to quit\n")
     
@@ -227,6 +243,11 @@ def main():
     frame_count = 0
     prev_time = time.perf_counter()
     fps = 0.0
+    last_snapshot_time = -1e9
+    event_active = False
+    event_peak_db = -1e9
+    event_peak_frame = None
+    event_peak_timestamp = None
     try:
         while True:
             # Get camera frame
@@ -249,6 +270,7 @@ def main():
                 
                 # Transpose and flip to fix coordinate system alignment
                 heatmap = np.flipud(np.fliplr(power_db.T))
+                observed_max_db = float(np.max(heatmap))
                 
             except StopIteration:
                 print("Audio stream ended")
@@ -261,7 +283,7 @@ def main():
             
             # Normalize for visualization using CLI-configurable db_max and db_range
             if db_mode == 'max':
-                max_db = np.max(heatmap)
+                max_db = observed_max_db
             else:
                 max_db = db_fixed_max
             min_db = max_db - db_range
@@ -293,6 +315,35 @@ def main():
             prev_time = now
             cv2.putText(blended_frame, f"FPS: {fps:.1f}", (20, 135),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+
+            # Optional snapshot capture: arm on threshold crossing, track peak,
+            # and save at event end (falling below threshold), limited to 1/s.
+            if snapshot_threshold is not None:
+                above_threshold = observed_max_db >= snapshot_threshold
+
+                if above_threshold:
+                    if not event_active:
+                        event_active = True
+                        event_peak_db = observed_max_db
+                        event_peak_frame = blended_frame.copy()
+                        event_peak_timestamp = datetime.now()
+                    elif observed_max_db >= event_peak_db:
+                        event_peak_db = observed_max_db
+                        event_peak_frame = blended_frame.copy()
+                        event_peak_timestamp = datetime.now()
+                elif event_active:
+                    # Event finished: save the best frame if outside cooldown.
+                    if (time.perf_counter() - last_snapshot_time) >= 1.0 and event_peak_frame is not None:
+                        stamp = event_peak_timestamp.strftime('%Y-%m-%d-%H%M%S.%f')[:-3]
+                        snapshot_path = path.join(snapshot_dir, f"{stamp}.png")
+                        cv2.imwrite(snapshot_path, event_peak_frame)
+                        last_snapshot_time = time.perf_counter()
+                        print(f"Snapshot saved: {snapshot_path} (peak {event_peak_db:.1f} dB SPL)")
+
+                    event_active = False
+                    event_peak_db = -1e9
+                    event_peak_frame = None
+                    event_peak_timestamp = None
             
             # Display result
             cv2.imshow('Simple Live Acoustic Camera (UMA-16)', blended_frame)
