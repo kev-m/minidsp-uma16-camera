@@ -1,4 +1,6 @@
 # Simple Live Acoustic Camera with Pre-Filtering
+import argparse
+import time
 import acoular as ac
 import numpy as np
 import cv2
@@ -26,18 +28,71 @@ mg = ac.MicGeom(file=micgeofile)
 TARGET_FREQ = 2000.0   # Target frequency in Hz
 BLOCK_SIZE = 2048      # Samples per processing block
 BLEND_ALPHA = 0.75     # Video transparency
+DEFAULT_GRID_HALF_WIDTH = 0.2
+DEFAULT_GRID_Z = 0.3
+DEFAULT_GRID_POINTS = 41
+DEFAULT_DB_MODE = 'max'
+DEFAULT_DB_RANGE = 3.0
 
-# Rectangular grid (matched to working simple_acoustic_camera.py)
-rg = ac.RectGrid(
-    x_min=-0.2, x_max=0.2,
-    y_min=-0.2, y_max=0.2,
-    z=0.3,  # Focus distance in meters
-    increment=0.01
-)
+def parse_grid_spec(spec):
+    """Parse --grid half_width,z,points into RectGrid params."""
+    parts = [p.strip() for p in spec.split(',')]
+    if len(parts) != 3:
+        raise ValueError("--grid must be in format half_width,z,points (example: 0.2,0.3,41)")
 
-# Calculate grid dimensions for reshaping
-GRID_X_DIM = rg.shape[0]
-GRID_Y_DIM = rg.shape[1]
+    half_width = float(parts[0])
+    z = float(parts[1])
+    points = int(parts[2])
+
+    if half_width <= 0:
+        raise ValueError("grid half_width must be > 0")
+    if z <= 0:
+        raise ValueError("grid z must be > 0")
+    if points < 2:
+        raise ValueError("grid points must be >= 2")
+
+    increment = (2.0 * half_width) / (points - 1)
+    return half_width, z, points, increment
+
+
+def parse_db_spec(spec):
+    """Parse --db db_max,db_range where db_max is 'max' or float."""
+    parts = [p.strip() for p in spec.split(',')]
+    if len(parts) != 2:
+        raise ValueError("--db must be in format db_max,db_range (example: max,3 or 85,3)")
+
+    db_max_token = parts[0].lower()
+    if db_max_token == 'max':
+        db_mode = 'max'
+        db_fixed_max = None
+    else:
+        db_mode = 'fixed'
+        db_fixed_max = float(parts[0])
+
+    db_range = float(parts[1])
+    if db_range <= 0:
+        raise ValueError("db_range must be > 0")
+
+    return db_mode, db_fixed_max, db_range
+
+
+def build_arg_parser():
+    default_grid = f"{DEFAULT_GRID_HALF_WIDTH},{DEFAULT_GRID_Z},{DEFAULT_GRID_POINTS}"
+    default_db = f"{DEFAULT_DB_MODE},{DEFAULT_DB_RANGE:g}"
+    parser = argparse.ArgumentParser(description='Simple live acoustic camera with pre-filtered beamforming')
+    parser.add_argument(
+        '--grid',
+        type=str,
+        default=default_grid,
+        help='Grid as half_width,z,points. Example: --grid 0.2,0.3,41'
+    )
+    parser.add_argument(
+        '--db',
+        type=str,
+        default=default_db,
+        help="dB normalization as db_max,db_range where db_max is 'max' or a fixed value. Example: --db max,3 or --db 85,3"
+    )
+    return parser
 
 # -----------------------------------------------------------------------------
 # HELPER FUNCTIONS
@@ -97,6 +152,26 @@ def find_camera():
 # LIVE CAPTURE & PROCESSING LOOP
 # -----------------------------------------------------------------------------
 def main():
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    try:
+        grid_half_width, grid_z, grid_points, grid_increment = parse_grid_spec(args.grid)
+        db_mode, db_fixed_max, db_range = parse_db_spec(args.db)
+    except ValueError as e:
+        parser.error(str(e))
+        return
+
+    # Rectangular grid from CLI or defaults
+    rg = ac.RectGrid(
+        x_min=-grid_half_width, x_max=grid_half_width,
+        y_min=-grid_half_width, y_max=grid_half_width,
+        z=grid_z,
+        increment=grid_increment
+    )
+    grid_x_dim = rg.shape[0]
+    grid_y_dim = rg.shape[1]
+
     # Verify audio device and camera
     if not find_uma16_device():
         return
@@ -137,7 +212,12 @@ def main():
     print("\nStarting live acoustic camera with pre-filtering...")
     print(f"Microphone array: {NUM_CHANNELS} channels at {fs} Hz")
     print(f"Target frequency: {TARGET_FREQ} Hz (octave band)")
-    print(f"Grid: {GRID_X_DIM}x{GRID_Y_DIM} points = {GRID_X_DIM * GRID_Y_DIM} grid points")
+    print(f"Grid: {grid_x_dim}x{grid_y_dim} points = {grid_x_dim * grid_y_dim} grid points")
+    print(f"Grid params: half_width={grid_half_width}, z={grid_z}, increment={grid_increment:.6f}")
+    if db_mode == 'max':
+        print(f"dB normalization: db_max=max(frame), db_range={db_range}")
+    else:
+        print(f"dB normalization: db_max={db_fixed_max}, db_range={db_range}")
     print(f"Block size: {BLOCK_SIZE} samples")
     print("Press 'q' to quit\n")
     
@@ -145,6 +225,8 @@ def main():
     beamformer_iter = bb.result(num=BLOCK_SIZE)
     
     frame_count = 0
+    prev_time = time.perf_counter()
+    fps = 0.0
     try:
         while True:
             # Get camera frame
@@ -177,9 +259,11 @@ def main():
                 traceback.print_exc()
                 continue
             
-            # Normalize for visualization with 3 dB dynamic range (matching simple_acoustic_camera.py)
-            db_range = 3.0
-            max_db = np.max(heatmap)
+            # Normalize for visualization using CLI-configurable db_max and db_range
+            if db_mode == 'max':
+                max_db = np.max(heatmap)
+            else:
+                max_db = db_fixed_max
             min_db = max_db - db_range
             heatmap_clipped = np.clip(heatmap, min_db, max_db)
             heatmap_norm = ((heatmap_clipped - min_db) / db_range * 255).astype(np.uint8)
@@ -198,6 +282,16 @@ def main():
             cv2.putText(blended_frame, f"Max: {max_db:.1f} dB SPL", (20, 75),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
             cv2.putText(blended_frame, f"Pre-filtered beamforming", (20, 105),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+
+            # Smoothed framerate estimate.
+            now = time.perf_counter()
+            dt = now - prev_time
+            if dt > 0:
+                inst_fps = 1.0 / dt
+                fps = inst_fps if fps == 0.0 else (0.9 * fps + 0.1 * inst_fps)
+            prev_time = now
+            cv2.putText(blended_frame, f"FPS: {fps:.1f}", (20, 135),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
             
             # Display result
