@@ -1,0 +1,5 @@
+acoular>=26.0
+opencv-python>=4.13
+numpy>=2.2
+sounddevice>=0.5
+scipy>=1.15
