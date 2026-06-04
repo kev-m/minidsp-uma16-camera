@@ -1,6 +1,7 @@
 # Acoustic Camera Applications for miniDSP UMA-16
 
-Real-time acoustic visualization applications using the miniDSP UMA-16 microphone array and video camera. These applications overlay acoustic heatmaps on live video to visualize sound source locations.
+Real-time acoustic visualization applications using the miniDSP UMA-16 microphone array and video camera. 
+These applications overlay acoustic heatmaps on live video to visualize sound source locations.
 
 ## Hardware Requirements
 
@@ -10,7 +11,39 @@ Real-time acoustic visualization applications using the miniDSP UMA-16 microphon
 
 ## Applications
 
-### 1. `simple_acoustic_camera.py` - Batch Processing (Robust & Reliable)
+### 1. `live_acoustic_camera.py` - Continuous Streaming (Fast)
+
+#### Algorithm: Pre-Filtered Time-Domain Beamforming
+
+**Processing Pipeline:**
+```
+Audio Stream (continuous) → Amplification → Octave Filter (2kHz) → Beamforming → RMS Power
+```
+
+**How It Works:**
+1. **Continuous audio stream** - Single persistent audio source, no recreation
+2. **Pre-filtering** - Applies octave band filter at 2 kHz to **each microphone channel independently**
+3. **Time-domain beamforming** - Uses `BeamformerTime` on filtered signals to apply spatial delays
+4. **RMS power calculation** - Computes power at each grid point over time window
+5. **Video overlay** - Blends heatmap with camera frame
+
+**Key Characteristics:**
+- ✅ **True continuous processing** - Pipeline created once, streams indefinitely
+- ✅ **Lower latency** - ~43ms per block (2048 samples at 48 kHz)
+- ✅ **More efficient** - No object recreation, lower overhead
+- ✅ **Frequency-selective** - Octave band filter isolates target frequency before spatial processing
+- 📊 **Pre-filtering approach** - Filters microphones first, then applies beamforming
+
+**Configuration:**
+- **Grid:** 41×41 points (0.4m × 0.4m at 0.3m distance)
+- **Target Frequency:** 2000 Hz (octave band)
+- **Block Size:** 2048 samples
+- **Dynamic Range:** 3 dB
+- **Amplification:** 10× gain on all channels
+
+---
+
+### 2. `batched_acoustic_camera.py` - Batch Processing (Proof of concept. Robust & Reliable)
 
 #### Algorithm: Frequency-Domain Beamforming
 
@@ -43,41 +76,9 @@ Audio Capture (batch) → Amplification → FFT (PowerSpectra) → Beamforming �
 
 ---
 
-### 2. `simple_live_acoustic_camera.py` - Continuous Streaming (Optimized)
-
-#### Algorithm: Pre-Filtered Time-Domain Beamforming
-
-**Processing Pipeline:**
-```
-Audio Stream (continuous) → Amplification → Octave Filter (2kHz) → Beamforming → RMS Power
-```
-
-**How It Works:**
-1. **Continuous audio stream** - Single persistent audio source, no recreation
-2. **Pre-filtering** - Applies octave band filter at 2 kHz to **each microphone channel independently**
-3. **Time-domain beamforming** - Uses `BeamformerTime` on filtered signals to apply spatial delays
-4. **RMS power calculation** - Computes power at each grid point over time window
-5. **Video overlay** - Blends heatmap with camera frame
-
-**Key Characteristics:**
-- ✅ **True continuous processing** - Pipeline created once, streams indefinitely
-- ✅ **Lower latency** - ~43ms per block (2048 samples at 48 kHz)
-- ✅ **More efficient** - No object recreation, lower overhead
-- ✅ **Frequency-selective** - Octave band filter isolates target frequency before spatial processing
-- 📊 **Pre-filtering approach** - Filters microphones first, then applies beamforming
-
-**Configuration:**
-- **Grid:** 41×41 points (0.4m × 0.4m at 0.3m distance)
-- **Target Frequency:** 2000 Hz (octave band)
-- **Block Size:** 2048 samples
-- **Dynamic Range:** 3 dB
-- **Amplification:** 10× gain on all channels
-
----
-
 ## Algorithm Comparison
 
-| Aspect | `simple_acoustic_camera.py` | `simple_live_acoustic_camera.py` |
+| Aspect | `batched_acoustic_camera.py` | `live_acoustic_camera.py` |
 |--------|----------------------------|----------------------------------|
 | **Processing Domain** | Frequency (FFT) | Time (filtered signals) |
 | **Pipeline Recreation** | Every frame | Once at startup |
@@ -103,7 +104,8 @@ heatmap = np.flipud(np.fliplr(power_db.T))
 - **Transformation:** Transpose, flip horizontally, flip vertically
 
 ### Frequency Limitations
-The UMA-16 array geometry at the configured grid spacing supports accurate beamforming up to approximately **2 kHz**. Above this frequency, spatial aliasing and sidelobes reduce accuracy.
+The UMA-16 array geometry at the configured grid spacing supports accurate beamforming up to approximately **2 kHz**. 
+Above this frequency, spatial aliasing and sidelobes reduce accuracy.
 
 ### Grid Configuration
 Both use a small, close-range grid optimized for near-field sources:
@@ -120,12 +122,12 @@ Both use a small, close-range grid optimized for near-field sources:
 
 **Batch Processing (Reliable):**
 ```bash
-python simple_acoustic_camera.py
+python batched_acoustic_camera.py
 ```
 
 **Continuous Streaming (Fast):**
 ```bash
-python simple_live_acoustic_camera.py
+python live_acoustic_camera.py
 ```
 
 Both applications will:
@@ -173,8 +175,8 @@ scipy>=1.15
 
 ## Performance Notes
 
-- **Frame Rate:** Both applications achieve 15-30 FPS depending on system performance
-- **CPU Usage:** `simple_live_acoustic_camera.py` is more CPU-efficient due to persistent pipeline
+- **Frame Rate:** The live camera achieves around 20 FPS on my system, while the batched one achieves around 5 FPS.
+- **CPU Usage:** `live_acoustic_camera.py` is more CPU-efficient due to persistent pipeline
 - **Memory:** Both maintain minimal memory footprint with no caching enabled
 - **Latency:** Continuous streaming version has ~5× lower latency
 
@@ -182,13 +184,13 @@ scipy>=1.15
 
 ## When to Use Which
 
-### Use `simple_acoustic_camera.py` when:
+### Use `batched_acoustic_camera.py` when:
 - You need **proven, reliable** spatial tracking
 - Accuracy is more important than latency
 - You're validating the beamforming setup
 - You're using it as a reference implementation
 
-### Use `simple_live_acoustic_camera.py` when:
+### Use `live_acoustic_camera.py` when:
 - You need **lowest possible latency**
 - Real-time responsiveness is critical
 - You want maximum efficiency (battery, CPU)
@@ -207,3 +209,5 @@ scipy>=1.15
 ## License
 
 These applications are provided as-is for educational and research purposes.
+
+

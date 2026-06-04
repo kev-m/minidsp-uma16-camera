@@ -3,6 +3,7 @@ import acoular as ac
 import numpy as np
 import cv2
 import sounddevice as sd
+import time
 from os import path
 
 # Hacky
@@ -131,6 +132,8 @@ def main():
     print("Press 'q' to quit\n")
         
     frame_count = 0
+    prev_time = time.perf_counter()
+    fps = 0.0
     try:
         while True:
             # Get camera frame
@@ -196,6 +199,16 @@ def main():
             cv2.putText(blended_frame, f"Max: {max_db:.1f} dB SPL", (20, 75),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
             cv2.putText(blended_frame, f"Block size: {BLOCK_SIZE}", (20, 105),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+
+            # Smoothed framerate estimate.
+            now = time.perf_counter()
+            dt = now - prev_time
+            if dt > 0:
+                inst_fps = 1.0 / dt
+                fps = inst_fps if fps == 0.0 else (0.9 * fps + 0.1 * inst_fps)
+            prev_time = now
+            cv2.putText(blended_frame, f"FPS: {fps:.1f}", (20, 135),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
             
             # Display result

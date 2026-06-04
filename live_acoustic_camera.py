@@ -1,8 +1,11 @@
-# 1. IMPORT ACOULAR FIRST (Fixes the Numba / OpenBLAS parallel performance warning)
+# Simple Live Acoustic Camera with Pre-Filtering
+import argparse
+import time
 import acoular as ac
 import numpy as np
 import cv2
 import sounddevice as sd
+from os import path
 
 # Disable Acoular's HDF5 caching for live processing
 ac.config.global_caching = 'none'
@@ -10,183 +13,220 @@ ac.config.global_caching = 'none'
 # -----------------------------------------------------------------------------
 # HARDWARE CONFIGURATION
 # -----------------------------------------------------------------------------
-# To find your device, run: python -c "import sounddevice as sd; print(sd.query_devices())"
-# Look for the UMA-16 device with 16 input channels
-# IMPORTANT: Use WASAPI (device 20), NOT WDM-KS (device 35) - WDM-KS doesn't support blocking API!
-UMA16_DEVICE_INDEX = 21  # Line (MCHStreamer Multi-channels), Windows WASAPI
+UMA16_DEVICE_INDEX = None  # Line (MCHStreamer Multi-channels), Windows WASAPI
 NUM_CHANNELS = 16
 SAMPLE_RATE = 48000
-
-# Load UMA-16 microphone geometry from Acoular's built-in XML file
-# Uses the official miniDSP UMA-16 microphone positions
-mic_geom = ac.MicGeom(file='.venv/Lib/site-packages/acoular/xml/minidsp_uma-16_mirrored.xml')
-
-# Camera to use
 CAMERA_INDEX = 1
 
+# Load UMA-16 microphone geometry
+micgeofile = path.join(path.split(ac.__file__)[0], 'xml', 'minidsp_uma-16_mirrored.xml')
+mg = ac.MicGeom(file=micgeofile)
+
 # -----------------------------------------------------------------------------
-# ACOUSTIC GRID & STEERING VECTOR
+# ACOUSTIC GRID & PROCESSING SETTINGS
 # -----------------------------------------------------------------------------
-# Production-tested settings from config.json
-GRID_DISTANCE = 2.0  # Focus distance in meters
-GRID_INCREMENT = 0.05  # Grid spacing (coarser = faster processing)
-GRID_X_MIN = -1.5
-GRID_X_MAX = 1.5
-GRID_Y_MIN = -1.5
-GRID_Y_MAX = 1.5
+TARGET_FREQ = 2000.0   # Target frequency in Hz
+BLOCK_SIZE = 2048      # Samples per processing block
+BLEND_ALPHA = 0.75     # Video transparency
+DEFAULT_GRID_HALF_WIDTH = 0.2
+DEFAULT_GRID_Z = 0.3
+DEFAULT_GRID_POINTS = 41
+DEFAULT_DB_MODE = 'max'
+DEFAULT_DB_RANGE = 3.0
 
-grid = ac.RectGrid(
-    x_min=GRID_X_MIN, x_max=GRID_X_MAX, 
-    y_min=GRID_Y_MIN, y_max=GRID_Y_MAX, 
-    z=GRID_DISTANCE, 
-    increment=GRID_INCREMENT
-)
+def parse_grid_spec(spec):
+    """Parse --grid half_width,z,points into RectGrid params."""
+    parts = [p.strip() for p in spec.split(',')]
+    if len(parts) != 3:
+        raise ValueError("--grid must be in format half_width,z,points (example: 0.2,0.3,41)")
 
-# Calculate grid dimensions for reshaping
-GRID_X_DIM = int((GRID_X_MAX - GRID_X_MIN) / GRID_INCREMENT + 1)
-GRID_Y_DIM = int((GRID_Y_MAX - GRID_Y_MIN) / GRID_INCREMENT + 1)
+    half_width = float(parts[0])
+    z = float(parts[1])
+    points = int(parts[2])
 
-# Was 4000
-TARGET_FREQ = 2000.0  # Target frequency in Hz (higher freq = better resolution)
-AVERAGING_SAMPLES = 512  # Number of samples to average for stability
-BLEND_ALPHA = 0.75  # Video transparency (0.75 from production config)
+    if half_width <= 0:
+        raise ValueError("grid half_width must be > 0")
+    if z <= 0:
+        raise ValueError("grid z must be > 0")
+    if points < 2:
+        raise ValueError("grid points must be >= 2")
+
+    increment = (2.0 * half_width) / (points - 1)
+    return half_width, z, points, increment
+
+
+def parse_db_spec(spec):
+    """Parse --db db_max,db_range where db_max is 'max' or float."""
+    parts = [p.strip() for p in spec.split(',')]
+    if len(parts) != 2:
+        raise ValueError("--db must be in format db_max,db_range (example: max,3 or 85,3)")
+
+    db_max_token = parts[0].lower()
+    if db_max_token == 'max':
+        db_mode = 'max'
+        db_fixed_max = None
+    else:
+        db_mode = 'fixed'
+        db_fixed_max = float(parts[0])
+
+    db_range = float(parts[1])
+    if db_range <= 0:
+        raise ValueError("db_range must be > 0")
+
+    return db_mode, db_fixed_max, db_range
+
+
+def build_arg_parser():
+    default_grid = f"{DEFAULT_GRID_HALF_WIDTH},{DEFAULT_GRID_Z},{DEFAULT_GRID_POINTS}"
+    default_db = f"{DEFAULT_DB_MODE},{DEFAULT_DB_RANGE:g}"
+    parser = argparse.ArgumentParser(description='Simple live acoustic camera with pre-filtered beamforming')
+    parser.add_argument(
+        '--grid',
+        type=str,
+        default=default_grid,
+        help='Grid as half_width,z,points. Example: --grid 0.2,0.3,41'
+    )
+    parser.add_argument(
+        '--db',
+        type=str,
+        default=default_db,
+        help="dB normalization as db_max,db_range where db_max is 'max' or a fixed value. Example: --db max,3 or --db 85,3"
+    )
+    return parser
 
 # -----------------------------------------------------------------------------
 # HELPER FUNCTIONS
 # -----------------------------------------------------------------------------
 def find_uma16_device():
     """Find and verify the UMA-16 audio device."""
+    global UMA16_DEVICE_INDEX
+
     devices = sd.query_devices()
-    print(f"\nUsing audio device {UMA16_DEVICE_INDEX}:")
-    if UMA16_DEVICE_INDEX < len(devices):
-        dev = devices[UMA16_DEVICE_INDEX]
-        print(f"  Name: {dev['name']}")
-        print(f"  Channels: {dev['max_input_channels']} in, {dev['max_output_channels']} out")
-        print(f"  Sample rate: {dev['default_samplerate']} Hz")
-        print(f"  Host API: {sd.query_hostapis(dev['hostapi'])['name']}")
-        
-        if dev['max_input_channels'] < NUM_CHANNELS:
-            print(f"\n⚠️  WARNING: Device only has {dev['max_input_channels']} input channels, but {NUM_CHANNELS} required!")
-            print("\nAvailable devices with 16+ input channels (prefer WASAPI):")
-            for i, device in enumerate(devices):
-                if device['max_input_channels'] >= NUM_CHANNELS:
-                    api_name = sd.query_hostapis(device['hostapi'])['name']
-                    print(f"  {i}: {device['name']} ({device['max_input_channels']} in) [{api_name}]")
+    
+    if UMA16_DEVICE_INDEX is None:
+        # Search for a device with NUM_CHANNELS input channels
+        print(f"\nSearching for a device with {NUM_CHANNELS} input channels...")
+        for idx, dev in enumerate(devices):
+            if dev['max_input_channels'] >= NUM_CHANNELS:
+                print(f"Found suitable device at index {idx}:")
+                print(f"  Name: {dev['name']}")
+                print(f"  Channels: {dev['max_input_channels']} in")
+                print(f"  Host API: {sd.query_hostapis(dev['hostapi'])['name']}")
+                UMA16_DEVICE_INDEX = idx
+                return True
+        print(f"⚠️  No device with {NUM_CHANNELS} input channels found!")
+        return False
+    else:
+        print(f"\nUsing audio device {UMA16_DEVICE_INDEX}:")
+        if UMA16_DEVICE_INDEX < len(devices):
+            dev = devices[UMA16_DEVICE_INDEX]
+            print(f"  Name: {dev['name']}")
+            print(f"  Channels: {dev['max_input_channels']} in")
+            print(f"  Host API: {sd.query_hostapis(dev['hostapi'])['name']}")
+            
+            if dev['max_input_channels'] < NUM_CHANNELS:
+                print(f"\n⚠️  WARNING: Device only has {dev['max_input_channels']} input channels!")
+                return False
+            return True
+        else:
+            print(f"⚠️  Device {UMA16_DEVICE_INDEX} not found!")
             return False
+
+def find_camera():
+    """Find and verify the camera."""
+    print(f"\nUsing camera {CAMERA_INDEX}")
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    if cap.isOpened():
+        ret, frame = cap.read()
+        if ret:
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            print(f"  Resolution: {width}x{height}")
+        cap.release()
         return True
     else:
-        print(f"⚠️  Device {UMA16_DEVICE_INDEX} not found!")
+        print(f"⚠️  Camera {CAMERA_INDEX} not found!")
         return False
-
-def find_uma16_camera():
-    """Enumerate cameras and find the UMA-16 camera."""
-    print("\nScanning for cameras...")
-    cameras_found = []
-    
-    # Try first 10 camera indices
-    for i in range(10):
-        cap = cv2.VideoCapture(i)
-        if cap.isOpened():
-            # Try to get camera name (not always available in OpenCV)
-            ret, frame = cap.read()
-            if ret:
-                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                cameras_found.append((i, width, height))
-                print(f"  Camera {i}: {width}x{height}")
-            cap.release()
-    
-    if not cameras_found:
-        print("⚠️  No cameras found!")
-        return None
-    
-    # If CAMERA_INDEX is set, use it
-    if CAMERA_INDEX is not None:
-        if any(cam[0] == CAMERA_INDEX for cam in cameras_found):
-            print(f"\nUsing specified camera {CAMERA_INDEX}")
-            return CAMERA_INDEX
-        else:
-            print(f"⚠️  Specified camera {CAMERA_INDEX} not found!")
-    
-    # Otherwise, use the first camera
-    selected = cameras_found[0][0]
-    print(f"\nUsing camera {selected} (set CAMERA_INDEX to override)")
-    return selected
 
 # -----------------------------------------------------------------------------
 # LIVE CAPTURE & PROCESSING LOOP
 # -----------------------------------------------------------------------------
 def main():
-    # Verify audio device
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    try:
+        grid_half_width, grid_z, grid_points, grid_increment = parse_grid_spec(args.grid)
+        db_mode, db_fixed_max, db_range = parse_db_spec(args.db)
+    except ValueError as e:
+        parser.error(str(e))
+        return
+
+    # Rectangular grid from CLI or defaults
+    rg = ac.RectGrid(
+        x_min=-grid_half_width, x_max=grid_half_width,
+        y_min=-grid_half_width, y_max=grid_half_width,
+        z=grid_z,
+        increment=grid_increment
+    )
+    grid_x_dim = rg.shape[0]
+    grid_y_dim = rg.shape[1]
+
+    # Verify audio device and camera
     if not find_uma16_device():
         return
+    if not find_camera():
+        return
     
-    # Determine which camera to use
-    if CAMERA_INDEX is not None:
-        camera_idx = CAMERA_INDEX
-        print(f"\nUsing specified camera {camera_idx}")
-    else:
-        camera_idx = find_uma16_camera()
-        if camera_idx is None:
-            return
-    
-    cap = cv2.VideoCapture(camera_idx)
+    # Open camera
+    cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
-        print(f"Error: Could not open camera {camera_idx}.")
+        print(f"Error: Could not open camera {CAMERA_INDEX}.")
         return
 
     print("\nSetting up Acoular processing pipeline...")
     
-    # Build the Acoular pipeline (same as process.py)
-    # Step 1: Audio source from hardware
+    # Setup continuous audio source
     audio_source = ac.SoundDeviceSamplesGenerator(
         device=UMA16_DEVICE_INDEX, 
         num_channels=NUM_CHANNELS
     )
     
-    # Step 2: Convert from volts to pascals (miniDSP UMA-16 sensitivity: 0.0016 V/Pa)
-    source_mixer = ac.SourceMixer(
-        sources=[audio_source], 
-        weights=np.array([1/0.0016])
-    )
+    # Get actual sample frequency from the audio source
+    fs = audio_source.sample_freq
     
-    # Step 3: Time-domain beamformer
-    # Steering Vector
-    steer = ac.SteeringVector(env=ac.Environment(c=343), grid=grid, mics=mic_geom)
-
-    beamformer = ac.BeamformerBase(
-        source=source_mixer, 
-        steer=steer
-    )
+    # Apply amplification first
+    amped_source = ac.Calib(source=audio_source)
+    amped_source.data = np.full(NUM_CHANNELS, 10.0)  # Gain of 10.0 for all channels
     
-    # Step 4: Filter to target frequency band (fractional octave)
-    frequency_filter = ac.FiltOctave(
-        source=beamformer, 
-        band=TARGET_FREQ, 
-        fraction='Third octave'
-    )
+    # Apply octave band filter at target frequency BEFORE beamforming
+    # FiltOctave filters all channels independently
+    filtered_source = ac.FiltOctave(source=amped_source, band=TARGET_FREQ)
     
-    # Step 5: Calculate instantaneous power
-    power = ac.TimePower(source=frequency_filter)
+    # Create steering vector (constant across frames)
+    st = ac.SteeringVector(grid=rg, mics=mg)
     
-    # Step 6: Time average for stability
-    time_average = ac.Average(
-        source=power, 
-        num_per_average=AVERAGING_SAMPLES
-    )
+    # Create TIME-DOMAIN beamformer on FILTERED signals
+    bb = ac.BeamformerTime(source=filtered_source, steer=st)
     
-    print("\nStarting live acoustic camera...")
-    print(f"Microphone array: {NUM_CHANNELS} channels at {audio_source.sample_freq} Hz")
-    print(f"Target frequency: {TARGET_FREQ} Hz (Third octave band)")
-    print(f"Grid: {GRID_X_DIM}x{GRID_Y_DIM} points ({GRID_X_MIN} to {GRID_X_MAX}m)")
-    print(f"Focus distance: {GRID_DISTANCE}m")
-    print(f"Grid increment: {GRID_INCREMENT}m")
+    print("\nStarting live acoustic camera with pre-filtering...")
+    print(f"Microphone array: {NUM_CHANNELS} channels at {fs} Hz")
+    print(f"Target frequency: {TARGET_FREQ} Hz (octave band)")
+    print(f"Grid: {grid_x_dim}x{grid_y_dim} points = {grid_x_dim * grid_y_dim} grid points")
+    print(f"Grid params: half_width={grid_half_width}, z={grid_z}, increment={grid_increment:.6f}")
+    if db_mode == 'max':
+        print(f"dB normalization: db_max=max(frame), db_range={db_range}")
+    else:
+        print(f"dB normalization: db_max={db_fixed_max}, db_range={db_range}")
+    print(f"Block size: {BLOCK_SIZE} samples")
     print("Press 'q' to quit\n")
     
-    # Create generator for beamforming results
-    beamforming_gen = time_average.result(num=1)
+    # Create iterator for continuous beamforming on filtered signals
+    beamformer_iter = bb.result(num=BLOCK_SIZE)
     
     frame_count = 0
+    prev_time = time.perf_counter()
+    fps = 0.0
     try:
         while True:
             # Get camera frame
@@ -195,44 +235,67 @@ def main():
                 print("Camera read failed")
                 break
             
-            # Get next beamforming result from Acoular pipeline
+            # Get beamforming result from pre-filtered signals
             try:
-                acoustic_result = next(beamforming_gen)
+                # Get next beamformed block: shape (num_samples, num_grid_points)
+                # Input has already been filtered at TARGET_FREQ before beamforming
+                block = next(beamformer_iter)
+                
+                # Compute RMS power for each grid point
+                power = np.sqrt(np.mean(block**2, axis=0))
+                spatial_map = power.reshape(rg.shape)
+                
+                power_db = ac.L_p(spatial_map)
+                
+                # Transpose and flip to fix coordinate system alignment
+                heatmap = np.flipud(np.fliplr(power_db.T))
+                
             except StopIteration:
                 print("Audio stream ended")
                 break
             except Exception as e:
                 print(f"Beamforming error: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
             
-            # Convert to dB SPL and reshape to 2D grid
-            acoustic_map_db = ac.L_p(acoustic_result)
-            heatmap = acoustic_map_db.reshape((GRID_X_DIM, GRID_Y_DIM))
+            # Normalize for visualization using CLI-configurable db_max and db_range
+            if db_mode == 'max':
+                max_db = np.max(heatmap)
+            else:
+                max_db = db_fixed_max
+            min_db = max_db - db_range
+            heatmap_clipped = np.clip(heatmap, min_db, max_db)
+            heatmap_norm = ((heatmap_clipped - min_db) / db_range * 255).astype(np.uint8)
             
-            # Flip y-axis for correct display orientation
-            heatmap = heatmap[:, ::-1]
-            
-            # Normalize for visualization (0-255)
-            heatmap_norm = cv2.normalize(heatmap, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-            
-            # Resize to match camera frame and apply colormap
-            heatmap_resized = cv2.resize(heatmap_norm, (frame.shape[1], frame.shape[0]))
+            # Resize to match camera frame and apply colormap (bicubic interpolation)
+            heatmap_resized = cv2.resize(heatmap_norm, (frame.shape[1], frame.shape[0]), 
+                                        interpolation=cv2.INTER_CUBIC)
             heatmap_color = cv2.applyColorMap(heatmap_resized, cv2.COLORMAP_JET)
             
-            # Blend with camera frame (using production alpha value)
+            # Blend with camera frame
             blended_frame = cv2.addWeighted(frame, 1 - BLEND_ALPHA, heatmap_color, BLEND_ALPHA, 0)
             
-            # Add overlay text with info
-            max_db = np.max(acoustic_map_db)
-            cv2.putText(blended_frame, f"Acoustic Camera: {int(TARGET_FREQ)} Hz @ {GRID_DISTANCE}m", (20, 40),
+            # Add overlay text
+            cv2.putText(blended_frame, f"Live Acoustic Camera: {int(TARGET_FREQ)} Hz", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
             cv2.putText(blended_frame, f"Max: {max_db:.1f} dB SPL", (20, 75),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(blended_frame, f"Grid: {GRID_X_DIM}x{GRID_Y_DIM} ({GRID_INCREMENT}m)", (20, 105),
+            cv2.putText(blended_frame, f"Pre-filtered beamforming", (20, 105),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+
+            # Smoothed framerate estimate.
+            now = time.perf_counter()
+            dt = now - prev_time
+            if dt > 0:
+                inst_fps = 1.0 / dt
+                fps = inst_fps if fps == 0.0 else (0.9 * fps + 0.1 * inst_fps)
+            prev_time = now
+            cv2.putText(blended_frame, f"FPS: {fps:.1f}", (20, 135),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
             
             # Display result
-            cv2.imshow('Live Acoustic Camera (UMA-16)', blended_frame)
+            cv2.imshow('Simple Live Acoustic Camera (UMA-16)', blended_frame)
             
             frame_count += 1
             
