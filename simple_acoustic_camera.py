@@ -166,8 +166,9 @@ def main():
                 # Reshape to 2D grid
                 heatmap1 = Lm.reshape(rg.shape)
                 
-                # Transpose to match imshow orientation
-                heatmap = heatmap1.T
+                # Transpose and flip to fix coordinate system alignment
+                # Acoustic coordinates: Y-up, X-right; Image coordinates: Y-down, X-right
+                heatmap = np.flipud(np.fliplr(heatmap1.T))
                 
             except Exception as e:
                 print(f"Beamforming error: {e}")
