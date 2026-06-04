@@ -5,9 +5,11 @@ Real-time acoustic visualization applications using the miniDSP UMA-16 microphon
 These applications overlay acoustic heatmaps on live video to visualize sound source locations.
 
 Tracking mouse clicks:
+
 ![Tracking mouse clicks](snapshots/2026-06-04-132901.594.png)
 
 Guess where is the sparrow?
+
 ![Guess where is the sparrow?](snapshots/2026-06-04-135313.244.png)
 
 ## Hardware Requirements
